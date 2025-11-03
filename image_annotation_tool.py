@@ -14,6 +14,11 @@
 import sys
 import os
 import glob
+import shutil
+import datetime
+import base64
+import requests
+import io
 from typing import List, Tuple, Optional
 import numpy as np
 import cv2
@@ -74,10 +79,17 @@ class ImageCanvas(QLabel):
         # 光标相关
         self.cursor_visible = False
         self.cursor_pos = QPoint()
+        # 显示模式: 'overlay' (默认), 'original', 'mask'
+        self.display_mode = 'overlay'
         
         # 多边形绘制相关（以图像坐标存储点）
         self.polygon_points = []  # type: list
         self.polygon_active = False
+        
+        # AI分割相关
+        self.ai_points = []  # AI点采集列表 [[x, y, label], ...]
+        self.ai_mode_active = False
+        self.previous_tool_mode = "brush"  # 用于P键恢复
         
     def set_images(self, image_path: str, mask_path: str):
         """设置要显示的图像和mask"""
@@ -88,12 +100,19 @@ class ImageCanvas(QLabel):
                 raise ValueError(f"无法加载图像: {image_path}")
             self.original_image = cv2.cvtColor(self.original_image, cv2.COLOR_BGR2RGB)
             
-            # 加载或创建mask
+            # 加载或创建mask - 允许mask不存在，不报错
             if os.path.exists(mask_path):
-                self.mask_image = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-                if self.mask_image is None:
+                try:
+                    self.mask_image = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+                    if self.mask_image is None:
+                        # 读取失败，创建空mask
+                        self.mask_image = np.zeros(self.original_image.shape[:2], dtype=np.uint8)
+                except Exception as e:
+                    # 读取异常，创建空mask，不中断
+                    print(f"Warning: Failed to load mask {mask_path}: {e}")
                     self.mask_image = np.zeros(self.original_image.shape[:2], dtype=np.uint8)
             else:
+                # mask不存在，创建空mask，允许用户从头标注
                 self.mask_image = np.zeros(self.original_image.shape[:2], dtype=np.uint8)
             
             # 确保mask尺寸与图像匹配
@@ -112,16 +131,23 @@ class ImageCanvas(QLabel):
         """更新显示的图像"""
         if self.original_image is None:
             return
-        
-        # 创建彩色mask
+        # 创建彩色mask (绿色)
         mask_colored = np.zeros_like(self.original_image)
-        mask_colored[self.mask_image > 0] = [255, 0, 0]  # 红色mask
-        
-        # Alpha混合
-        self.display_image = cv2.addWeighted(
-            self.original_image, 1.0, 
-            mask_colored, self.alpha, 0
-        )
+        # 使用绿色通道显示mask
+        mask_colored[self.mask_image > 0] = [0, 255, 0]
+
+        # 根据display_mode选择输出
+        if self.display_mode == 'original':
+            self.display_image = self.original_image.copy()
+        elif self.display_mode == 'mask':
+            # 纯mask视图（黑底绿前景）
+            self.display_image = mask_colored.copy()
+        else:
+            # overlay 混合
+            self.display_image = cv2.addWeighted(
+                self.original_image, 1.0,
+                mask_colored, self.alpha, 0
+            )
         
         # 转换为QPixmap
         height, width, channel = self.display_image.shape
@@ -162,10 +188,24 @@ class ImageCanvas(QLabel):
         # 如果从多边形模式切换出去，取消未完成的多边形
         if getattr(self, 'tool_mode', None) in ("polygon_add", "polygon_erase") and mode not in ("polygon_add", "polygon_erase"):
             self.cancel_polygon()
+        # 如果从AI模式切换出去，清除AI点
+        if getattr(self, 'tool_mode', None) == "ai_segment" and mode != "ai_segment":
+            self.ai_points = []
+            self.ai_mode_active = False
+        # 保存切换前的模式（用于P键恢复）
+        current = getattr(self, 'tool_mode', 'brush')
+        if mode == "ai_segment" and current != "ai_segment":
+            self.previous_tool_mode = current
         self.tool_mode = mode
         # 隐藏系统光标，使用自定义绘制
         self.setCursor(QCursor(Qt.BlankCursor))
         self.update()
+
+    def set_display_mode(self, mode: str):
+        """设置显示模式：'overlay'|'original'|'mask'"""
+        if mode in ('overlay', 'original', 'mask'):
+            self.display_mode = mode
+            self.update_display()
     
     def set_brush_width(self, width: int):
         """设置画笔半宽（像素）"""
@@ -210,12 +250,30 @@ class ImageCanvas(QLabel):
                     else:
                         self.polygon_points.append(img_pos)
                         self.update()
+            elif self.tool_mode == "ai_segment":
+                # AI分割模式：收集点
+                img_pos = self.screen_to_image_coords(event.pos())
+                if img_pos is not None:
+                    # 左键添加正样本点（label=1）
+                    self.ai_points.append([img_pos[0], img_pos[1], 1])
+                    self.ai_mode_active = True
+                    self.update()
+                    print(f"AI点添加: {img_pos}, label=1 (正样本)")
         elif event.button() == Qt.RightButton and self.original_image is not None:
-            # 右键：开始拖拽平移
-            self.dragging = True
-            self.drag_start_pos = event.pos()
-            self.drag_start_offset = QPoint(self.image_pos)
-            self.setCursor(QCursor(Qt.ClosedHandCursor))
+            if self.tool_mode == "ai_segment":
+                # AI模式下右键添加负样本点（label=0）
+                img_pos = self.screen_to_image_coords(event.pos())
+                if img_pos is not None:
+                    self.ai_points.append([img_pos[0], img_pos[1], 0])
+                    self.ai_mode_active = True
+                    self.update()
+                    print(f"AI点添加: {img_pos}, label=0 (负样本)")
+            else:
+                # 右键：开始拖拽平移
+                self.dragging = True
+                self.drag_start_pos = event.pos()
+                self.drag_start_offset = QPoint(self.image_pos)
+                self.setCursor(QCursor(Qt.ClosedHandCursor))
 
     def mouseDoubleClickEvent(self, event):
         """双击结束多边形"""
@@ -263,6 +321,17 @@ class ImageCanvas(QLabel):
     def keyPressEvent(self, event):
         """键盘事件（处理多边形：回车提交、退格撤点、ESC取消）"""
         handled = False
+        # 快捷键 F/G 支持：在多边形模式下快速切换为增加/删除模式
+        if event.key() == Qt.Key_F:
+            # 切换到多边形增加模式
+            self.window().poly_add_radio.setChecked(True) if self.window() is not None else None
+            self.set_tool_mode('polygon_add')
+            handled = True
+        elif event.key() == Qt.Key_G:
+            # 切换到多边形删除模式
+            self.window().poly_erase_radio.setChecked(True) if self.window() is not None else None
+            self.set_tool_mode('polygon_erase')
+            handled = True
         if self.tool_mode in ("polygon_add", "polygon_erase") and self.polygon_active:
             if event.key() in (Qt.Key_Return, Qt.Key_Enter):
                 if len(self.polygon_points) >= 3:
@@ -548,6 +617,10 @@ class ImageCanvas(QLabel):
         if self.original_image is not None and self.polygon_active and len(self.polygon_points) >= 1:
             self.draw_polygon_preview(painter)
         
+        # 绘制AI点
+        if self.original_image is not None and self.ai_mode_active and len(self.ai_points) > 0:
+            self.draw_ai_points(painter)
+        
         painter.end()
     
     def draw_cursor(self, painter: QPainter):
@@ -577,6 +650,11 @@ class ImageCanvas(QLabel):
             int(cursor_h)
         )
         painter.drawRect(rotated_rect)
+        # 绘制中心小红点（便于精确对齐）
+        dot_radius = max(2, int(min(cursor_w, cursor_h) * 0.06))
+        painter.setPen(QPen(QColor(255, 0, 0)))
+        painter.setBrush(QBrush(QColor(255, 0, 0)))
+        painter.drawEllipse(QRect(int(-dot_radius), int(-dot_radius), int(dot_radius * 2), int(dot_radius * 2)))
         painter.restore()
 
     def image_to_screen_coords(self, img_x: int, img_y: int) -> Optional[QPoint]:
@@ -619,6 +697,24 @@ class ImageCanvas(QLabel):
         painter.setPen(QPen(QColor(0, 255, 0), 2))
         for p in screen_points:
             painter.drawEllipse(p, 3, 3)
+
+    def draw_ai_points(self, painter: QPainter):
+        """绘制AI标注点（正样本绿色，负样本红色）"""
+        if not self.ai_points:
+            return
+        for point_data in self.ai_points:
+            ix, iy, label = point_data[0], point_data[1], point_data[2]
+            sp = self.image_to_screen_coords(int(ix), int(iy))
+            if sp is not None:
+                # 正样本绿色，负样本红色
+                color = QColor(0, 255, 0) if label == 1 else QColor(255, 0, 0)
+                painter.setPen(QPen(color, 3))
+                painter.setBrush(QBrush(color))
+                painter.drawEllipse(sp, 5, 5)
+                # 画十字标记
+                painter.drawLine(sp.x() - 8, sp.y(), sp.x() + 8, sp.y())
+                painter.drawLine(sp.x(), sp.y() - 8, sp.x(), sp.y() + 8)
+
 
     def _near_first_point(self, img_pos: Tuple[int, int], threshold: int = 5) -> bool:
         """判断是否接近首点（图像像素距离）"""
@@ -674,6 +770,9 @@ class AnnotationTool(QMainWindow):
         self.redo_stack = []
         self.max_undo_steps = 50
         
+        # AI模式切换状态
+        self.previous_tool_radio = None
+        
         # 初始化UI
         self.init_ui()
         self.init_shortcuts()
@@ -699,8 +798,8 @@ class AnnotationTool(QMainWindow):
             new_value = max(0, current_value - 1)
             self.rotation_slider.setValue(new_value)
             return
-        elif key == Qt.Key_C and modifiers == Qt.NoModifier:
-            # C键：增加1度
+        elif key == Qt.Key_V and modifiers == Qt.NoModifier:
+            # V键：增加1度（原先使用 C，已改为 V 以保留 C 用作视图切换）
             current_value = self.rotation_slider.value()
             new_value = min(360, current_value + 1)
             self.rotation_slider.setValue(new_value)
@@ -708,6 +807,72 @@ class AnnotationTool(QMainWindow):
         elif key == Qt.Key_R and modifiers == Qt.NoModifier:
             # R键：重置图像缩放与位置
             self.reset_view()
+            return
+
+        # 一键清除当前图像（先备份）：T
+        if key == Qt.Key_T and modifiers == Qt.NoModifier:
+            self.clear_current_annotation_with_backup()
+            return
+
+        # 快捷键 F/G：切换多边形增加/删除模式（主窗口级别，避免焦点问题）
+        if key == Qt.Key_F and modifiers == Qt.NoModifier:
+            try:
+                self.poly_add_radio.setChecked(True)
+            except Exception:
+                pass
+            self.canvas.set_tool_mode('polygon_add')
+            return
+        if key == Qt.Key_G and modifiers == Qt.NoModifier:
+            try:
+                self.poly_erase_radio.setChecked(True)
+            except Exception:
+                pass
+            self.canvas.set_tool_mode('polygon_erase')
+            return
+        
+        # H键：切换到AI分割模式
+        if key == Qt.Key_H and modifiers == Qt.NoModifier:
+            try:
+                self.ai_radio.setChecked(True)
+            except Exception:
+                pass
+            self.canvas.set_tool_mode('ai_segment')
+            return
+        
+        # P键：切换绘制点模式/恢复原模式
+        if key == Qt.Key_P and modifiers == Qt.NoModifier:
+            if self.canvas.tool_mode == "ai_segment":
+                # 当前是AI模式，恢复到之前的工具
+                prev_mode = getattr(self.canvas, 'previous_tool_mode', 'brush')
+                if prev_mode == "brush":
+                    self.brush_radio.setChecked(True)
+                elif prev_mode == "eraser":
+                    self.eraser_radio.setChecked(True)
+                elif prev_mode == "polygon_add":
+                    self.poly_add_radio.setChecked(True)
+                elif prev_mode == "polygon_erase":
+                    self.poly_erase_radio.setChecked(True)
+                self.canvas.set_tool_mode(prev_mode)
+            else:
+                # 切换到AI绘制点模式
+                self.ai_radio.setChecked(True)
+                self.canvas.set_tool_mode('ai_segment')
+            return
+
+        # 切换显示模式：C，在 overlay->original->mask 三模式间循环
+        if key == Qt.Key_C and modifiers == Qt.NoModifier:
+            modes = ['overlay', 'original', 'mask']
+            cur = getattr(self.canvas, 'display_mode', 'overlay')
+            try:
+                idx = modes.index(cur)
+            except ValueError:
+                idx = 0
+            new = modes[(idx + 1) % len(modes)]
+            self.canvas.set_display_mode(new)
+            try:
+                self.display_toggle_btn.setText(f"C键切换显示: {new.capitalize()}")
+            except Exception:
+                pass
             return
         
         # 原有的快捷键处理
@@ -838,20 +1003,23 @@ class AnnotationTool(QMainWindow):
         self.tool_group = QButtonGroup()
         self.brush_radio = QRadioButton("画笔 (增加) - S键")
         self.eraser_radio = QRadioButton("橡皮擦 (删除) - E键")
-        self.poly_add_radio = QRadioButton("多边形 (增加)")
-        self.poly_erase_radio = QRadioButton("多边形 (删除)")
+        self.poly_add_radio = QRadioButton("多边形 (增加) -F键")
+        self.poly_erase_radio = QRadioButton("多边形 (删除) -G键")
+        self.ai_radio = QRadioButton("绘制点 (AI) - P键")
         self.brush_radio.setChecked(True)
 
         self.tool_group.addButton(self.brush_radio, 0)
         self.tool_group.addButton(self.eraser_radio, 1)
         self.tool_group.addButton(self.poly_add_radio, 2)
         self.tool_group.addButton(self.poly_erase_radio, 3)
+        self.tool_group.addButton(self.ai_radio, 4)
         self.tool_group.buttonClicked.connect(self.tool_changed)
 
         tools_layout.addWidget(self.brush_radio)
         tools_layout.addWidget(self.eraser_radio)
         tools_layout.addWidget(self.poly_add_radio)
         tools_layout.addWidget(self.poly_erase_radio)
+        tools_layout.addWidget(self.ai_radio)
 
         # 画笔半宽/半高
         brush_w_layout = QHBoxLayout()
@@ -886,6 +1054,39 @@ class AnnotationTool(QMainWindow):
         
         layout.addWidget(tools_group)
         
+        # AI分割设置组
+        ai_group = QGroupBox("AI分割设置")
+        ai_layout = QVBoxLayout(ai_group)
+        
+        # SAM服务器配置
+        sam_server_layout = QHBoxLayout()
+        sam_server_layout.addWidget(QLabel("SAM服务器:"))
+        self.sam_server_input = QLineEdit()
+        self.sam_server_input.setText("http://segmentation.ensightful.xyz")
+        self.sam_server_input.setPlaceholderText("http://IP:端口")
+        sam_server_layout.addWidget(self.sam_server_input)
+        ai_layout.addLayout(sam_server_layout)
+        
+        # AI操作按钮
+        ai_buttons_layout = QHBoxLayout()
+        self.ai_segment_btn = QPushButton("执行分割")
+        self.ai_segment_btn.clicked.connect(self.run_ai_segmentation)
+        self.ai_segment_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+        ai_buttons_layout.addWidget(self.ai_segment_btn)
+        
+        self.ai_clear_btn = QPushButton("清除点")
+        self.ai_clear_btn.clicked.connect(self.clear_ai_points)
+        ai_buttons_layout.addWidget(self.ai_clear_btn)
+        ai_layout.addLayout(ai_buttons_layout)
+        
+        # AI提示信息
+        ai_tip = QLabel("左键:正样本点 右键:负样本点\n点击\"执行分割\"调用SAM")
+        ai_tip.setStyleSheet("color: gray; font-size: 10px;")
+        ai_tip.setWordWrap(True)
+        ai_layout.addWidget(ai_tip)
+        
+        layout.addWidget(ai_group)
+        
         # 显示设置组
         display_group = QGroupBox("显示设置")
         display_layout = QVBoxLayout(display_group)
@@ -907,6 +1108,10 @@ class AnnotationTool(QMainWindow):
         zoom_tip.setStyleSheet("color: gray; font-size: 10px;")
         zoom_tip.setWordWrap(True)
         display_layout.addWidget(zoom_tip)
+        # 显示模式切换按钮
+        self.display_toggle_btn = QPushButton("C键切换显示: Overlay")
+        self.display_toggle_btn.clicked.connect(self.cycle_display_mode)
+        display_layout.addWidget(self.display_toggle_btn)
         
         layout.addWidget(display_group)
         
@@ -915,17 +1120,23 @@ class AnnotationTool(QMainWindow):
         edit_layout = QVBoxLayout(edit_group)
         
         edit_buttons_layout = QHBoxLayout()
-        self.undo_btn = QPushButton("撤销")
+        self.undo_btn = QPushButton("撤销Ctrl+Z")
         self.undo_btn.clicked.connect(self.undo)
-        self.redo_btn = QPushButton("重做")
+        self.redo_btn = QPushButton("重做Ctrl+Y")
         self.redo_btn.clicked.connect(self.redo)
         edit_buttons_layout.addWidget(self.undo_btn)
         edit_buttons_layout.addWidget(self.redo_btn)
         edit_layout.addLayout(edit_buttons_layout)
-        
-        clear_btn = QPushButton("清除所有标注")
-        clear_btn.clicked.connect(self.clear_all_annotations)
-        edit_layout.addWidget(clear_btn)
+
+        # 清除当前图像标注（已有）
+        clear_current_btn = QPushButton("清除当前标注 T键")
+        clear_current_btn.clicked.connect(self.clear_all_annotations)
+        edit_layout.addWidget(clear_current_btn)
+
+        # 清除所有图像的标注（批量）
+        #clear_all_btn = QPushButton("清除所有图像标注")
+        #clear_all_btn.clicked.connect(self.clear_all_annotations_all_images)
+        #edit_layout.addWidget(clear_all_btn)
         
         layout.addWidget(edit_group)
         
@@ -961,12 +1172,12 @@ class AnnotationTool(QMainWindow):
         toolbar.addSeparator()
         
         # 撤销/重做动作
-        undo_action = QAction("撤销", self)
+        undo_action = QAction("撤销Ctrl+Z", self)
         undo_action.setShortcut(QKeySequence.Undo)
         undo_action.triggered.connect(self.undo)
         toolbar.addAction(undo_action)
         
-        redo_action = QAction("重做", self)
+        redo_action = QAction("重做Ctrl+Y", self)
         redo_action.setShortcut(QKeySequence.Redo)
         redo_action.triggered.connect(self.redo)
         toolbar.addAction(redo_action)
@@ -980,9 +1191,21 @@ class AnnotationTool(QMainWindow):
         # 工具切换快捷键
         self.brush_radio.setShortcut(QKeySequence(Qt.Key_S))  # 改为S键
         self.eraser_radio.setShortcut(QKeySequence(Qt.Key_E))
+        self.ai_radio.setShortcut(QKeySequence(Qt.Key_P))  # 绘制点模式
+        # 多边形快捷键 F/G（快速切换多边形增加/删除模式）
+        # 直接在主窗口或canvas捕获 F/G，通过 focusPolicy 已允许 canvas 接收
+        # 另外为显示切换添加快捷键 Shift+D
+        toggle_seq = QKeySequence(Qt.SHIFT + Qt.Key_D)
+        try:
+            self.display_toggle_btn.setShortcut(toggle_seq)
+        except Exception:
+            pass
     
     def load_images(self):
         """加载图像文件夹"""
+        if self.image_files and not self.maybe_save_pending_changes():
+            return
+
         base_dir = QFileDialog.getExistingDirectory(
             self, "选择包含images和labels子文件夹的根目录", "", QFileDialog.ShowDirsOnly
         )
@@ -1058,12 +1281,16 @@ class AnnotationTool(QMainWindow):
     def previous_image(self):
         """上一张图像"""
         if self.current_index > 0:
+            if not self.maybe_save_pending_changes():
+                return
             self.current_index -= 1
             self.load_current_image()
     
     def next_image(self):
         """下一张图像"""
         if self.current_index < len(self.image_files) - 1:
+            if not self.maybe_save_pending_changes():
+                return
             self.current_index += 1
             self.load_current_image()
     
@@ -1072,6 +1299,10 @@ class AnnotationTool(QMainWindow):
         try:
             index = int(self.jump_input.text()) - 1
             if 0 <= index < len(self.image_files):
+                if index == self.current_index:
+                    return
+                if not self.maybe_save_pending_changes():
+                    return
                 self.current_index = index
                 self.load_current_image()
             else:
@@ -1079,23 +1310,30 @@ class AnnotationTool(QMainWindow):
         except ValueError:
             QMessageBox.warning(self, "警告", "请输入有效的数字")
     
-    def save_current_annotation(self):
-        """保存当前标注"""
+    def save_current_annotation(self) -> bool:
+        """保存当前标注，成功返回 True"""
         if not self.image_files or self.canvas.mask_image is None:
-            return
+            return False
         
         try:
             image_path = self.image_files[self.current_index]
             image_name = os.path.basename(image_path)
             name_without_ext = os.path.splitext(image_name)[0]
             mask_path = os.path.join(self.labels_dir, f"{name_without_ext}.png")
-            
-            cv2.imwrite(mask_path, self.canvas.mask_image)
+
+            self.auto_save_timer.stop()
+
+            saved = cv2.imwrite(mask_path, self.canvas.mask_image)
+            if not saved:
+                raise IOError("cv2.imwrite 返回 False")
+
             self.unsaved_changes = False
             self.status_bar.showMessage(f"已保存: {mask_path}", 2000)
-            
+            return True
+
         except Exception as e:
             QMessageBox.critical(self, "错误", f"保存失败: {str(e)}")
+            return False
     
     def auto_save(self):
         """自动保存"""
@@ -1119,6 +1357,18 @@ class AnnotationTool(QMainWindow):
         """触发自动保存定时器"""
         self.auto_save_timer.stop()  # 停止之前的定时器
         self.auto_save_timer.start(self.auto_save_interval)  # 启动新的定时器
+
+    def maybe_save_pending_changes(self) -> bool:
+        """在切换图像或数据集前确保保存当前更改"""
+        if not self.unsaved_changes:
+            self.auto_save_timer.stop()
+            return True
+
+        if self.save_current_annotation():
+            return True
+
+        self.status_bar.showMessage("保存当前标注失败，已取消切换。", 4000)
+        return False
     
     def tool_changed(self):
         """工具改变"""
@@ -1130,6 +1380,8 @@ class AnnotationTool(QMainWindow):
             self.canvas.set_tool_mode("polygon_add")
         elif self.poly_erase_radio.isChecked():
             self.canvas.set_tool_mode("polygon_erase")
+        elif self.ai_radio.isChecked():
+            self.canvas.set_tool_mode("ai_segment")
     
     def brush_size_changed(self, size):
         """画笔大小改变"""
@@ -1145,6 +1397,57 @@ class AnnotationTool(QMainWindow):
         alpha = value / 100.0
         self.alpha_label.setText(f"{alpha:.2f}")
         self.canvas.set_alpha(alpha)
+
+    def cycle_display_mode(self):
+        """在 overlay -> original -> mask 之间切换显示模式"""
+        modes = ['overlay', 'original', 'mask']
+        cur = self.canvas.display_mode if hasattr(self.canvas, 'display_mode') else 'overlay'
+        try:
+            idx = modes.index(cur)
+        except ValueError:
+            idx = 0
+        next_mode = modes[(idx + 1) % len(modes)]
+        self.canvas.set_display_mode(next_mode)
+        # 更新按钮文字
+        self.display_toggle_btn.setText(f"C键切换显示: {next_mode.capitalize()}")
+
+    def clear_all_annotations_all_images(self):
+        """清除已加载数据集下所有图像的标注（labels文件夹内所有png置零）"""
+        if not self.image_files or not self.labels_dir:
+            QMessageBox.information(self, "信息", "尚未加载任何图像文件夹")
+            return
+
+        reply = QMessageBox.question(
+            self, "确认", "确定要清除当前数据集中所有图像的标注吗？此操作不可逆。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        # 保存当前状态以便撤销
+        self.save_undo_state()
+
+        count = 0
+        for img_path in self.image_files:
+            name = os.path.splitext(os.path.basename(img_path))[0]
+            mask_path = os.path.join(self.labels_dir, f"{name}.png")
+            try:
+                # 写入全零mask，确保与原图大小匹配
+                img = cv2.imread(img_path)
+                if img is None:
+                    continue
+                h, w = img.shape[:2]
+                zero_mask = np.zeros((h, w), dtype=np.uint8)
+                cv2.imwrite(mask_path, zero_mask)
+                count += 1
+            except Exception:
+                continue
+
+        # 重新加载当前mask并刷新显示
+        self.canvas.set_images(self.image_files[self.current_index], os.path.join(self.labels_dir, f"{os.path.splitext(os.path.basename(self.image_files[self.current_index]))[0]}.png"))
+        self.status_bar.showMessage(f"已清除 {count} 张图像的标注", 4000)
+        self.unsaved_changes = True
     
     def save_undo_state(self):
         """保存撤销状态"""
@@ -1189,17 +1492,219 @@ class AnnotationTool(QMainWindow):
         self.redo_btn.setEnabled(len(self.redo_stack) > 0)
     
     def clear_all_annotations(self):
-        """清除所有标注"""
+        """清除当前图像的所有标注（带撤销栈备份）"""
         reply = QMessageBox.question(
             self, "确认", "确定要清除当前图像的所有标注吗？",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No
         )
-        
+
         if reply == QMessageBox.Yes and self.canvas.mask_image is not None:
             self.save_undo_state()
+            # 进行单图备份
+            self._backup_current_mask()
             self.canvas.mask_image.fill(0)
             self.canvas.update_display()
             self.unsaved_changes = True
+
+    def _backup_current_mask(self):
+        """将当前图像的 mask 备份到 labels/backup/<timestamp>/ 下，保留原文件名"""
+        if not self.image_files:
+            return None
+        img_path = self.image_files[self.current_index]
+        name = os.path.splitext(os.path.basename(img_path))[0]
+        mask_path = os.path.join(self.labels_dir, f"{name}.png")
+        if not os.path.exists(mask_path):
+            return None
+
+        backup_dir = os.path.join(self.labels_dir, 'backup', datetime.datetime.now().strftime('%Y%m%d_%H%M%S'))
+        try:
+            os.makedirs(backup_dir, exist_ok=True)
+            shutil.copy2(mask_path, os.path.join(backup_dir, os.path.basename(mask_path)))
+            self.status_bar.showMessage(f"已备份当前mask到 {backup_dir}", 3000)
+            return backup_dir
+        except Exception as e:
+            QMessageBox.warning(self, "备份失败", f"无法备份当前mask: {e}")
+            return None
+
+    def clear_current_annotation_with_backup(self):
+        """为快捷键 T 使用：备份并清除当前图像的 mask（等同 clear_all_annotations 的单图版本）"""
+        if self.canvas.mask_image is None:
+            QMessageBox.information(self, "信息", "当前没有加载mask可清除")
+            return
+
+        reply = QMessageBox.question(
+            self, "确认", "确定要备份并清除当前图像的标注吗？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self.save_undo_state()
+        self._backup_current_mask()
+        self.canvas.mask_image.fill(0)
+        self.canvas.update_display()
+        self.unsaved_changes = True
+
+    def clear_ai_points(self):
+        """清除AI标注点"""
+        self.canvas.ai_points = []
+        self.canvas.ai_mode_active = False
+        self.canvas.update()
+        self.status_bar.showMessage("已清除AI标注点", 2000)
+
+    def run_ai_segmentation(self):
+        """执行AI分割"""
+        if not self.canvas.ai_points:
+            QMessageBox.warning(self, "警告", "请先在图像上标注点（左键:正样本，右键:负样本）")
+            return
+        
+        if self.canvas.original_image is None:
+            QMessageBox.warning(self, "警告", "请先加载图像")
+            return
+        
+        # 获取SAM服务器配置
+        server_url = self.sam_server_input.text().strip()
+        model = "vit_h"  # 固定使用vit_h模型
+        
+        if not server_url:
+            QMessageBox.warning(self, "警告", "请配置SAM服务器地址")
+            return
+        
+        try:
+            # 编码图像
+            self.status_bar.showMessage("正在编码图像...", 0)
+            QApplication.processEvents()
+            
+            # 将numpy图像转为PIL Image再转base64
+            pil_image = Image.fromarray(self.canvas.original_image)
+            img_buffer = io.BytesIO()
+            pil_image.save(img_buffer, format='JPEG', quality=95)
+            img_buffer.seek(0)
+            image_data = base64.b64encode(img_buffer.read()).decode('utf-8')
+            image_base64 = f"data:image/jpeg;base64,{image_data}"
+            
+            # 准备请求数据
+            data = {
+                "model": model,
+                "prompt_type": "point",
+                "image": image_base64,
+                "use_tensorrt": True,
+                "alpha": 0.5,
+                "points": self.canvas.ai_points,  # [[x, y, label], ...]
+            }
+            
+            self.status_bar.showMessage(f"正在调用SAM服务 ({len(self.canvas.ai_points)}个点)...", 0)
+            QApplication.processEvents()
+            
+            # 发送请求
+            response = requests.post(f"{server_url}/api/segment", json=data, timeout=30)
+            
+            if response.status_code == 200:
+                result = response.json()
+                
+                # 检查API返回格式
+                if not result.get('success', False):
+                    error_msg = result.get('error', 'Unknown error')
+                    QMessageBox.critical(self, "错误", f"SAM服务返回错误: {error_msg}")
+                    self.status_bar.showMessage(f"分割失败: {error_msg}", 3000)
+                    return
+                
+                self.status_bar.showMessage(
+                    f"分割成功! 耗时: {result['performance']['total_time_ms']:.0f}ms", 
+                    3000
+                )
+                
+                # 解析mask - 检查新的返回格式
+                result_data = result.get('result', {})
+                if 'masks' in result_data:
+                    masks_data = result_data['masks']
+                    if masks_data:
+                        # 取第一个mask（最佳结果）
+                        mask_item = masks_data[0]
+                        
+                        # 处理不同的返回格式
+                        if isinstance(mask_item, dict):
+                            # 如果是字典格式，可能包含data字段
+                            mask_base64 = mask_item.get('data', mask_item.get('mask', ''))
+                        elif isinstance(mask_item, str):
+                            # 如果是字符串格式（base64）
+                            mask_base64 = mask_item
+                        else:
+                            QMessageBox.warning(self, "警告", f"未知的mask格式: {type(mask_item)}")
+                            return
+                        
+                        # 解码base64
+                        if isinstance(mask_base64, str):
+                            if ',' in mask_base64:
+                                mask_base64 = mask_base64.split(',')[1]
+                            mask_bytes = base64.b64decode(mask_base64)
+                        else:
+                            QMessageBox.warning(self, "警告", f"mask_base64不是字符串: {type(mask_base64)}")
+                            return
+                        
+                        # 转为numpy数组
+                        mask_pil = Image.open(io.BytesIO(mask_bytes))
+                        new_mask = np.array(mask_pil)
+                        
+                        # 如果是RGB，转为灰度
+                        if len(new_mask.shape) == 3:
+                            new_mask = cv2.cvtColor(new_mask, cv2.COLOR_RGB2GRAY)
+                        
+                        # 二值化处理
+                        new_mask = (new_mask > 0).astype(np.uint8) * 255
+                        
+                        # 调整到原图尺寸
+                        if new_mask.shape != self.canvas.mask_image.shape:
+                            new_mask = cv2.resize(
+                                new_mask, 
+                                (self.canvas.mask_image.shape[1], self.canvas.mask_image.shape[0]),
+                                interpolation=cv2.INTER_NEAREST
+                            )
+                        
+                        # 保存撤销状态
+                        self.save_undo_state()
+                        
+                        # 叠加到现有mask（或运算）
+                        self.canvas.mask_image = np.maximum(self.canvas.mask_image, new_mask)
+                        self.canvas.update_display()
+                        self.unsaved_changes = True
+                        
+                        # 清除AI点
+                        self.canvas.ai_points = []
+                        self.canvas.ai_mode_active = False
+                        self.canvas.update()
+                        
+                        num_masks = result_data.get('info', {}).get('num_masks', len(masks_data))
+                        QMessageBox.information(
+                            self, 
+                            "成功", 
+                            f"AI分割完成并已叠加到现有mask\n生成了 {num_masks} 个mask"
+                        )
+                    else:
+                        QMessageBox.warning(self, "警告", "服务器返回的mask为空")
+                else:
+                    QMessageBox.warning(self, "警告", "服务器响应中没有masks数据")
+            else:
+                QMessageBox.critical(
+                    self, 
+                    "错误", 
+                    f"SAM服务调用失败 ({response.status_code})\n{response.text[:200]}"
+                )
+                self.status_bar.showMessage(f"分割失败: {response.status_code}", 3000)
+                
+        except requests.exceptions.Timeout:
+            QMessageBox.critical(self, "错误", "请求超时，请检查服务器是否正常运行")
+            self.status_bar.showMessage("分割请求超时", 3000)
+        except requests.exceptions.ConnectionError:
+            QMessageBox.critical(self, "错误", f"无法连接到SAM服务器: {server_url}")
+            self.status_bar.showMessage("连接失败", 3000)
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"AI分割失败: {str(e)}")
+            self.status_bar.showMessage(f"分割失败: {str(e)}", 3000)
+            import traceback
+            traceback.print_exc()
+        self.canvas.update_display()
+        self.unsaved_changes = True
     
     def closeEvent(self, event):
         """窗口关闭事件"""
@@ -1224,7 +1729,7 @@ class AnnotationTool(QMainWindow):
 def main():
     """主函数"""
     app = QApplication(sys.argv)
-    app.setApplicationName("图像语义标注工具")
+    app.setApplicationName("图像语义标注工具 V0.2")
     app.setOrganizationName("Image Annotation Tools")
     
     # 设置应用样式
